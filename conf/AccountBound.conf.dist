@@ -109,9 +109,3 @@ AccountBound.Friends.SyncOnlineChanges = 1
 AccountBound.Friends.SameFactionOnly = 0
 AccountBound.Friends.SyncIntervalSeconds = 3
 AccountBound.Friends.StartupBackfill = 1
-
-#
-# Deliberately character-specific and therefore not shared:
-# quests, inventory, gold, currencies, honor, arena rating, lockouts,
-# cooldowns, talents, glyphs, action bars, mail, auctions and hunter pets.
-#
