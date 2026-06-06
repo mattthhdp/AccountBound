@@ -1,0 +1,604 @@
+/*
+ * AccountWideFriends module for AzerothCore.
+ */
+
+#include "AccountBound.h"
+#include "Config.h"
+#include "DatabaseEnv.h"
+#include "Log.h"
+#include "ObjectGuid.h"
+#include "Player.h"
+#include "PlayerScript.h"
+#include "SocialMgr.h"
+#include "WorldScript.h"
+#include "WorldSession.h"
+
+#include <algorithm>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace
+{
+constexpr uint32 FriendFlag = SOCIAL_FLAG_FRIEND;
+constexpr uint32 WithoutFriendFlagMask = 0xFE;
+
+struct ModuleConfig
+{
+    bool Enabled = true;
+    bool SyncOnLogin = true;
+    bool SyncOnlineChanges = true;
+    bool StartupBackfill = false;
+    bool SameFactionOnly = false;
+    uint32 SyncIntervalMs = 3000;
+};
+
+struct CharacterInfo
+{
+    uint32 Guid = 0;
+    uint8 Race = 0;
+};
+
+using FriendMap = std::unordered_map<uint32, std::string>;
+
+ModuleConfig Config;
+std::unordered_map<uint32, uint32> UpdateTimersByCharacter;
+std::unordered_map<uint32, FriendMap> CachedFriendsByCharacter;
+
+bool IsEnabled()
+{
+    return Config.Enabled;
+}
+
+std::string EscapeSqlString(std::string text)
+{
+    CharacterDatabase.EscapeString(text);
+    return text;
+}
+
+bool CanShareBetweenRaces(uint8 ownerRace, uint8 friendRace)
+{
+    return !Config.SameFactionOnly || Player::TeamIdForRace(ownerRace) == Player::TeamIdForRace(friendRace);
+}
+
+std::vector<CharacterInfo> LoadAccountCharacterInfos(uint32 accountId)
+{
+    std::vector<CharacterInfo> characters;
+
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT guid, race FROM characters WHERE account = {}", accountId);
+
+    if (!result)
+        return characters;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        characters.push_back({ fields[0].Get<uint32>(), fields[1].Get<uint8>() });
+    } while (result->NextRow());
+
+    return characters;
+}
+
+std::vector<uint32> LoadAccountCharacters(uint32 accountId)
+{
+    std::vector<uint32> characterGuids;
+
+    for (CharacterInfo const& character : LoadAccountCharacterInfos(accountId))
+        characterGuids.push_back(character.Guid);
+
+    return characterGuids;
+}
+
+std::unordered_set<uint32> MakeGuidSet(std::vector<uint32> const& guids)
+{
+    return { guids.begin(), guids.end() };
+}
+
+std::unordered_set<uint32> MakeGuidSet(std::vector<CharacterInfo> const& characters)
+{
+    std::unordered_set<uint32> guids;
+
+    for (CharacterInfo const& character : characters)
+        guids.insert(character.Guid);
+
+    return guids;
+}
+
+uint8 LoadCharacterRace(uint32 characterGuid)
+{
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT race FROM characters WHERE guid = {}", characterGuid);
+
+    if (!result)
+        return 0;
+
+    return result->Fetch()[0].Get<uint8>();
+}
+
+bool CanCharacterShareWithFriend(CharacterInfo const& owner, uint32 friendGuid)
+{
+    uint8 const friendRace = LoadCharacterRace(friendGuid);
+    return friendRace && CanShareBetweenRaces(owner.Race, friendRace);
+}
+
+void RemoveFriendFromCharacter(uint32 ownerGuid, uint32 friendGuid)
+{
+    CharacterDatabase.DirectExecute(
+        "UPDATE character_social SET flags = flags & {} "
+        "WHERE guid = {} AND friend = {} AND (flags & {}) <> 0",
+        WithoutFriendFlagMask, ownerGuid, friendGuid, FriendFlag);
+
+    CharacterDatabase.DirectExecute(
+        "DELETE FROM character_social WHERE guid = {} AND friend = {} AND flags = 0",
+        ownerGuid, friendGuid);
+}
+
+FriendMap LoadCharacterFriends(uint32 characterGuid)
+{
+    FriendMap friends;
+
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT social.friend, COALESCE(social.note, ''), owner.race, friend_char.race "
+        "FROM character_social social "
+        "INNER JOIN characters owner ON owner.guid = social.guid "
+        "INNER JOIN characters friend_char ON friend_char.guid = social.friend "
+        "WHERE social.guid = {} AND owner.account <> friend_char.account AND (social.flags & {}) <> 0",
+        characterGuid, FriendFlag);
+
+    if (!result)
+        return friends;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 const friendGuid = fields[0].Get<uint32>();
+        uint8 const ownerRace = fields[2].Get<uint8>();
+        uint8 const friendRace = fields[3].Get<uint8>();
+
+        if (friendGuid && friendGuid != characterGuid && CanShareBetweenRaces(ownerRace, friendRace))
+            friends[friendGuid] = fields[1].Get<std::string>();
+    } while (result->NextRow());
+
+    return friends;
+}
+
+FriendMap LoadAccountFriendUnion(uint32 accountId)
+{
+    FriendMap friends;
+    std::vector<uint32> accountCharacters = LoadAccountCharacters(accountId);
+    std::unordered_set<uint32> ownCharacters = MakeGuidSet(accountCharacters);
+
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT social.friend, COALESCE(social.note, '') "
+        "FROM character_social social "
+        "INNER JOIN characters owner ON owner.guid = social.guid "
+        "WHERE owner.account = {} AND (social.flags & {}) <> 0 "
+        "ORDER BY social.note <> '' DESC",
+        accountId, FriendFlag);
+
+    if (!result)
+        return friends;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 const friendGuid = fields[0].Get<uint32>();
+
+        if (!friendGuid || ownCharacters.contains(friendGuid))
+            continue;
+
+        std::string const note = fields[1].Get<std::string>();
+        auto [itr, inserted] = friends.emplace(friendGuid, note);
+
+        if (!inserted && itr->second.empty() && !note.empty())
+            itr->second = note;
+    } while (result->NextRow());
+
+    return friends;
+}
+
+void InsertOrUpdateFriendForCharacter(uint32 ownerGuid, uint32 friendGuid, std::string const& note, bool forceNote)
+{
+    if (!ownerGuid || !friendGuid || ownerGuid == friendGuid)
+        return;
+
+    std::string safeNote = note.substr(0, 48);
+    safeNote = EscapeSqlString(safeNote);
+
+    if (forceNote)
+    {
+        CharacterDatabase.DirectExecute(
+            "INSERT INTO character_social (guid, friend, flags, note) VALUES ({}, {}, {}, '{}') "
+            "ON DUPLICATE KEY UPDATE flags = flags | {}, note = '{}'",
+            ownerGuid, friendGuid, FriendFlag, safeNote, FriendFlag, safeNote);
+        return;
+    }
+
+    CharacterDatabase.DirectExecute(
+        "INSERT INTO character_social (guid, friend, flags, note) VALUES ({}, {}, {}, '{}') "
+        "ON DUPLICATE KEY UPDATE flags = flags | {}, note = IF(VALUES(note) <> '', VALUES(note), note)",
+        ownerGuid, friendGuid, FriendFlag, safeNote, FriendFlag);
+}
+
+uint32 SyncFriendToCharacters(
+    std::vector<CharacterInfo> const& accountCharacters,
+    std::unordered_set<uint32> const& ownCharacters,
+    uint32 friendGuid,
+    std::string const& note,
+    bool forceNote)
+{
+    if (!friendGuid || ownCharacters.contains(friendGuid))
+        return 0;
+
+    uint32 synced = 0;
+
+    for (CharacterInfo const& owner : accountCharacters)
+    {
+        if (owner.Guid == friendGuid || !CanCharacterShareWithFriend(owner, friendGuid))
+            continue;
+
+        InsertOrUpdateFriendForCharacter(owner.Guid, friendGuid, note, forceNote);
+        ++synced;
+    }
+
+    return synced;
+}
+
+uint32 SyncFriendToAccount(uint32 accountId, uint32 friendGuid, std::string const& note, bool forceNote = false)
+{
+    std::vector<CharacterInfo> accountCharacters = LoadAccountCharacterInfos(accountId);
+    std::unordered_set<uint32> ownCharacters = MakeGuidSet(accountCharacters);
+
+    return SyncFriendToCharacters(accountCharacters, ownCharacters, friendGuid, note, forceNote);
+}
+
+void RemoveInvalidFactionFriends(uint32 accountId)
+{
+    if (!Config.SameFactionOnly || !accountId)
+        return;
+
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT social.guid, social.friend, owner.race, friend_char.race "
+        "FROM character_social social "
+        "INNER JOIN characters owner ON owner.guid = social.guid "
+        "INNER JOIN characters friend_char ON friend_char.guid = social.friend "
+        "WHERE owner.account = {} AND owner.account <> friend_char.account AND (social.flags & {}) <> 0",
+        accountId, FriendFlag);
+
+    if (!result)
+        return;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 const ownerGuid = fields[0].Get<uint32>();
+        uint32 const friendGuid = fields[1].Get<uint32>();
+        uint8 const ownerRace = fields[2].Get<uint8>();
+        uint8 const friendRace = fields[3].Get<uint8>();
+
+        if (!CanShareBetweenRaces(ownerRace, friendRace))
+            RemoveFriendFromCharacter(ownerGuid, friendGuid);
+    } while (result->NextRow());
+}
+
+void RemoveOwnAccountFriends(uint32 accountId)
+{
+    if (!accountId)
+        return;
+
+    CharacterDatabase.DirectExecute(
+        "UPDATE character_social social "
+        "INNER JOIN characters owner ON owner.guid = social.guid "
+        "INNER JOIN characters friend_char ON friend_char.guid = social.friend "
+        "SET social.flags = social.flags & {} "
+        "WHERE owner.account = {} AND friend_char.account = {} AND (social.flags & {}) <> 0",
+        WithoutFriendFlagMask, accountId, accountId, FriendFlag);
+
+    CharacterDatabase.DirectExecute(
+        "DELETE social FROM character_social social "
+        "INNER JOIN characters owner ON owner.guid = social.guid "
+        "INNER JOIN characters friend_char ON friend_char.guid = social.friend "
+        "WHERE owner.account = {} AND friend_char.account = {} AND social.flags = 0",
+        accountId, accountId);
+}
+
+bool RemoveOwnAccountFriendsFromPlayer(Player* player)
+{
+    if (!player || !player->GetSession())
+        return false;
+
+    bool changed = false;
+    uint32 const accountId = player->GetSession()->GetAccountId();
+    uint32 const playerGuid = player->GetGUID().GetCounter();
+    std::vector<CharacterInfo> accountCharacters = LoadAccountCharacterInfos(accountId);
+
+    for (CharacterInfo const& character : accountCharacters)
+    {
+        if (!character.Guid || character.Guid == playerGuid)
+            continue;
+
+        ObjectGuid const ownCharacterGuid = ObjectGuid::Create<HighGuid::Player>(character.Guid);
+
+        if (player->GetSocial()->HasFriend(ownCharacterGuid))
+        {
+            player->GetSocial()->RemoveFromSocialList(ownCharacterGuid, SOCIAL_FLAG_FRIEND);
+            changed = true;
+        }
+    }
+
+    if (changed)
+        player->GetSocial()->SendSocialList(player, SOCIAL_FLAG_FRIEND);
+
+    return changed;
+}
+
+uint32 SyncAccountFriends(uint32 accountId)
+{
+    RemoveOwnAccountFriends(accountId);
+    RemoveInvalidFactionFriends(accountId);
+
+    std::vector<CharacterInfo> accountCharacters = LoadAccountCharacterInfos(accountId);
+
+    if (accountCharacters.empty())
+        return 0;
+
+    std::unordered_set<uint32> ownCharacters = MakeGuidSet(accountCharacters);
+    FriendMap accountFriends = LoadAccountFriendUnion(accountId);
+    uint32 synced = 0;
+
+    for (auto const& [friendGuid, note] : accountFriends)
+        synced += SyncFriendToCharacters(accountCharacters, ownCharacters, friendGuid, note, false);
+
+    return synced;
+}
+
+void RemoveFriendFromAccount(uint32 accountId, uint32 friendGuid)
+{
+    if (!accountId || !friendGuid)
+        return;
+
+    CharacterDatabase.DirectExecute(
+        "UPDATE character_social social "
+        "INNER JOIN characters owner ON owner.guid = social.guid "
+        "SET social.flags = social.flags & {} "
+        "WHERE owner.account = {} AND social.friend = {} AND (social.flags & {}) <> 0",
+        WithoutFriendFlagMask, accountId, friendGuid, FriendFlag);
+
+    CharacterDatabase.DirectExecute(
+        "DELETE social FROM character_social social "
+        "INNER JOIN characters owner ON owner.guid = social.guid "
+        "WHERE owner.account = {} AND social.friend = {} AND social.flags = 0",
+        accountId, friendGuid);
+}
+
+void ApplyAccountFriendsToPlayer(Player* player)
+{
+    if (!player || !player->GetSession())
+        return;
+
+    uint32 const accountId = player->GetSession()->GetAccountId();
+    uint32 const playerGuid = player->GetGUID().GetCounter();
+    FriendMap accountFriends = LoadAccountFriendUnion(accountId);
+    CharacterInfo const playerInfo = { playerGuid, player->getRace(true) };
+    bool changed = false;
+
+    for (auto const& [friendGuid, note] : accountFriends)
+    {
+        if (!friendGuid || friendGuid == playerGuid || !CanCharacterShareWithFriend(playerInfo, friendGuid))
+            continue;
+
+        ObjectGuid const friendObjectGuid = ObjectGuid::Create<HighGuid::Player>(friendGuid);
+
+        if (!player->GetSocial()->HasFriend(friendObjectGuid))
+        {
+            if (player->GetSocial()->AddToSocialList(friendObjectGuid, SOCIAL_FLAG_FRIEND))
+            {
+                if (!note.empty())
+                    player->GetSocial()->SetFriendNote(friendObjectGuid, note);
+
+                changed = true;
+            }
+        }
+        else if (!note.empty())
+        {
+            player->GetSocial()->SetFriendNote(friendObjectGuid, note);
+        }
+    }
+
+    if (changed)
+        player->GetSocial()->SendSocialList(player, SOCIAL_FLAG_FRIEND);
+}
+
+void CacheCharacterFriends(uint32 characterGuid)
+{
+    CachedFriendsByCharacter[characterGuid] = LoadCharacterFriends(characterGuid);
+}
+
+void DetectAndSyncOnlineChanges(Player* player)
+{
+    if (!player || !player->GetSession())
+        return;
+
+    uint32 const accountId = player->GetSession()->GetAccountId();
+    uint32 const characterGuid = player->GetGUID().GetCounter();
+    RemoveOwnAccountFriends(accountId);
+    RemoveInvalidFactionFriends(accountId);
+    FriendMap currentFriends = LoadCharacterFriends(characterGuid);
+
+    auto cacheItr = CachedFriendsByCharacter.find(characterGuid);
+    if (cacheItr == CachedFriendsByCharacter.end())
+    {
+        CachedFriendsByCharacter[characterGuid] = std::move(currentFriends);
+        return;
+    }
+
+    FriendMap const& cachedFriends = cacheItr->second;
+    bool changed = false;
+
+    for (auto const& [friendGuid, note] : currentFriends)
+    {
+        auto cachedFriend = cachedFriends.find(friendGuid);
+
+        if (cachedFriend == cachedFriends.end())
+        {
+            SyncFriendToAccount(accountId, friendGuid, note);
+            changed = true;
+            continue;
+        }
+
+        if (cachedFriend->second != note)
+        {
+            SyncFriendToAccount(accountId, friendGuid, note, true);
+            changed = true;
+        }
+    }
+
+    for (auto const& cachedFriendEntry : cachedFriends)
+    {
+        uint32 const friendGuid = cachedFriendEntry.first;
+
+        if (!currentFriends.contains(friendGuid))
+        {
+            RemoveFriendFromAccount(accountId, friendGuid);
+            changed = true;
+        }
+    }
+
+    if (changed)
+    {
+        LOG_DEBUG("module.accountwidefriends", "AccountWideFriends: synced friend changes for account {} from character {}.", accountId, characterGuid);
+        ApplyAccountFriendsToPlayer(player);
+    }
+
+    CacheCharacterFriends(characterGuid);
+}
+
+void BackfillAllAccounts()
+{
+    QueryResult result = CharacterDatabase.Query(
+        "SELECT DISTINCT account FROM characters WHERE account <> 0");
+
+    if (!result)
+        return;
+
+    uint32 accountCount = 0;
+    uint32 syncCount = 0;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 const accountId = fields[0].Get<uint32>();
+
+        syncCount += SyncAccountFriends(accountId);
+        ++accountCount;
+    } while (result->NextRow());
+
+    LOG_INFO("module.accountwidefriends", "AccountWideFriends: startup backfill checked {} account(s) and queued {} friend row sync operation(s).", accountCount, syncCount);
+}
+
+void LoadModuleConfig()
+{
+    Config.Enabled = AccountBound::IsCategoryEnabled("Friends");
+    Config.SyncOnLogin = sConfigMgr->GetOption<bool>("AccountBound.Friends.SyncOnLogin", true);
+    Config.SyncOnlineChanges = sConfigMgr->GetOption<bool>("AccountBound.Friends.SyncOnlineChanges", true);
+    Config.StartupBackfill = sConfigMgr->GetOption<bool>("AccountBound.Friends.StartupBackfill", false);
+    Config.SameFactionOnly = sConfigMgr->GetOption<bool>("AccountBound.Friends.SameFactionOnly", false);
+    Config.SyncIntervalMs = std::max<uint32>(
+        1000,
+        sConfigMgr->GetOption<uint32>("AccountBound.Friends.SyncIntervalSeconds", 3) * 1000);
+}
+}
+
+class AccountWideFriendsWorldScript : public WorldScript
+{
+public:
+    AccountWideFriendsWorldScript() : WorldScript("AccountWideFriendsWorldScript", {
+        WORLDHOOK_ON_AFTER_CONFIG_LOAD,
+        WORLDHOOK_ON_STARTUP
+    }) { }
+
+    void OnAfterConfigLoad(bool reload) override
+    {
+        LoadModuleConfig();
+
+        LOG_INFO("module.accountwidefriends", "AccountWideFriends: {}. Enabled={}, LoginSync={}, OnlineSync={}, SameFactionOnly={}, IntervalMs={}, StartupBackfill={}.",
+            reload ? "configuration reloaded" : "configuration loaded",
+            Config.Enabled ? "on" : "off",
+            Config.Enabled && Config.SyncOnLogin ? "on" : "off",
+            Config.Enabled && Config.SyncOnlineChanges ? "on" : "off",
+            Config.Enabled && Config.SameFactionOnly ? "on" : "off",
+            Config.SyncIntervalMs,
+            Config.Enabled && Config.StartupBackfill ? "on" : "off");
+    }
+
+    void OnStartup() override
+    {
+        if (IsEnabled() && Config.StartupBackfill)
+            BackfillAllAccounts();
+    }
+};
+
+class AccountWideFriendsPlayerScript : public PlayerScript
+{
+public:
+    AccountWideFriendsPlayerScript() : PlayerScript("AccountWideFriendsPlayerScript", {
+        PLAYERHOOK_ON_LOGIN,
+        PLAYERHOOK_ON_LOGOUT,
+        PLAYERHOOK_ON_UPDATE
+    }) { }
+
+    void OnPlayerLogin(Player* player) override
+    {
+        if (!IsEnabled() || !player || !player->GetSession())
+            return;
+
+        uint32 const accountId = player->GetSession()->GetAccountId();
+
+        if (Config.SyncOnLogin)
+        {
+            bool const removedOwnCharacterFriends = RemoveOwnAccountFriendsFromPlayer(player);
+            uint32 const synced = SyncAccountFriends(accountId);
+            ApplyAccountFriendsToPlayer(player);
+
+            if (synced || removedOwnCharacterFriends)
+                LOG_DEBUG("module.accountwidefriends", "AccountWideFriends: login sync queued {} friend row operation(s) for account {}. RemovedOwnCharacterFriends={}.",
+                    synced, accountId, removedOwnCharacterFriends ? "yes" : "no");
+        }
+
+        CacheCharacterFriends(player->GetGUID().GetCounter());
+    }
+
+    void OnPlayerLogout(Player* player) override
+    {
+        if (!player)
+            return;
+
+        uint32 const characterGuid = player->GetGUID().GetCounter();
+        UpdateTimersByCharacter.erase(characterGuid);
+        CachedFriendsByCharacter.erase(characterGuid);
+    }
+
+    void OnPlayerUpdate(Player* player, uint32 diff) override
+    {
+        if (!IsEnabled() || !Config.SyncOnlineChanges || !player)
+            return;
+
+        uint32 const characterGuid = player->GetGUID().GetCounter();
+        uint32& timer = UpdateTimersByCharacter[characterGuid];
+        timer = std::min<uint32>(Config.SyncIntervalMs, timer + diff);
+
+        if (timer < Config.SyncIntervalMs)
+            return;
+
+        timer = 0;
+        DetectAndSyncOnlineChanges(player);
+    }
+};
+
+void AddAccountWideFriendsScripts()
+{
+    new AccountWideFriendsWorldScript();
+    new AccountWideFriendsPlayerScript();
+}
