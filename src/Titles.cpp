@@ -8,7 +8,6 @@
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
 #include "Log.h"
-#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "PlayerScript.h"
@@ -30,7 +29,7 @@ struct ModuleConfig
 {
     bool Enabled = true;
     bool StartupBackfill = true;
-    bool SyncOnLogin = true;
+    bool SyncOnCreate = true;
     bool SyncOnSave = true;
     bool SyncRealmFirst = false;
     bool ConvertFactionSpecific = true;
@@ -195,15 +194,6 @@ uint32 MergeTitlesForRace(KnownTitlesMask const& sourceTitles, uint8 sourceRace,
     return added;
 }
 
-void SetPlayerKnownTitles(Player* player, KnownTitlesMask const& titles)
-{
-    if (!player)
-        return;
-
-    for (uint32 index = 0; index < titles.size(); ++index)
-        player->SetUInt32Value(PLAYER__FIELD_KNOWN_TITLES + index, titles[index]);
-}
-
 void AppendOrCommit(CharacterDatabaseTransaction& trans, std::string_view sql)
 {
     if (!trans)
@@ -231,7 +221,7 @@ void UpdateTitlesForCharacter(CharacterDatabaseTransaction& trans, uint32 target
         KnownTitlesToString(titles), targetGuid));
 }
 
-void LoadAccountTitlesForPlayer(Player* player)
+void BackfillTitlesForCharacter(Player* player)
 {
     if (!Config.Enabled || !player)
         return;
@@ -239,8 +229,14 @@ void LoadAccountTitlesForPlayer(Player* player)
     uint32 const accountId = player->GetSession()->GetAccountId();
     uint32 const targetGuid = player->GetGUID().GetCounter();
     uint8 const targetRace = player->getRace(true);
-    KnownTitlesMask targetTitles = GetPlayerKnownTitles(player);
+    KnownTitlesMask targetTitles = {};
     uint32 added = 0;
+    QueryResult targetResult = CharacterDatabase.Query(
+        "SELECT COALESCE(knownTitles, '') FROM characters WHERE guid = {}", targetGuid);
+
+    if (targetResult)
+        targetTitles = ParseKnownTitles(targetResult->Fetch()[0].Get<std::string>());
+
     QueryResult result = CharacterDatabase.Query(
         "SELECT guid, race, COALESCE(knownTitles, '') "
         "FROM characters WHERE account = {} AND guid <> {}",
@@ -259,17 +255,14 @@ void LoadAccountTitlesForPlayer(Player* player)
 
     if (added)
     {
-        SetPlayerKnownTitles(player, targetTitles);
         CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
         UpdateTitlesForCharacter(trans, targetGuid, targetTitles);
         CommitIfNeeded(trans);
 
         LOG_INFO("module.accountboundtitles",
-            "AccountBoundTitles: loaded {} account title(s) for character {}.",
+            "AccountBoundTitles: seeded {} account title(s) for character {}.",
             added, targetGuid);
     }
-
-    LastKnownTitlesByCharacter[targetGuid] = targetTitles;
 }
 
 void SyncTitlesFromPlayerToAccount(Player* player)
@@ -312,9 +305,6 @@ void SyncTitlesFromPlayerToAccount(Player* player)
             continue;
 
         UpdateTitlesForCharacter(trans, targetGuid, targetTitles);
-
-        if (Player* onlineTarget = ObjectAccessor::FindPlayerByLowGUID(targetGuid))
-            SetPlayerKnownTitles(onlineTarget, targetTitles);
 
         ++updatedCharacters;
         addedTitles += added;
@@ -397,7 +387,7 @@ void LoadModuleConfig()
 {
     Config.Enabled = AccountBound::IsCategoryEnabled("Titles");
     Config.StartupBackfill = sConfigMgr->GetOption<bool>("AccountBound.Titles.StartupBackfill", true);
-    Config.SyncOnLogin = sConfigMgr->GetOption<bool>("AccountBound.Titles.SyncOnLogin", true);
+    Config.SyncOnCreate = sConfigMgr->GetOption<bool>("AccountBound.Titles.SyncOnCreate", true);
     Config.SyncOnSave = sConfigMgr->GetOption<bool>("AccountBound.Titles.SyncOnSave", true);
     Config.SyncRealmFirst = sConfigMgr->GetOption<bool>("AccountBound.Titles.SyncRealmFirst", false);
     Config.ConvertFactionSpecific = sConfigMgr->GetOption<bool>("AccountBound.Titles.ConvertFactionSpecific", true);
@@ -417,9 +407,9 @@ public:
     {
         LoadModuleConfig();
         LOG_INFO("module.accountboundtitles",
-            "AccountBoundTitles: {}. LoginSync={}, SaveSync={}, StartupBackfill={}, RealmFirst={}.",
+            "AccountBoundTitles: {}. CreateSync={}, SaveSync={}, StartupBackfill={}, RealmFirst={}.",
             Config.Enabled ? (reload ? "configuration reloaded" : "configuration loaded") : "disabled",
-            Config.Enabled && Config.SyncOnLogin ? "on" : "off",
+            Config.Enabled && Config.SyncOnCreate ? "on" : "off",
             Config.Enabled && Config.SyncOnSave ? "on" : "off",
             Config.Enabled && Config.StartupBackfill ? "on" : "off",
             Config.Enabled && Config.SyncRealmFirst ? "on" : "off");
@@ -447,15 +437,14 @@ public:
 
     void OnPlayerLoadFromDB(Player* player) override
     {
-        if (Config.SyncOnLogin)
-            LoadAccountTitlesForPlayer(player);
-        else if (player)
+        if (player)
             LastKnownTitlesByCharacter[player->GetGUID().GetCounter()] = GetPlayerKnownTitles(player);
     }
 
     void OnPlayerCreate(Player* player) override
     {
-        LoadAccountTitlesForPlayer(player);
+        if (Config.SyncOnCreate)
+            BackfillTitlesForCharacter(player);
     }
 
     void OnPlayerSave(Player* player) override

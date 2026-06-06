@@ -88,9 +88,8 @@ struct ModuleConfig
 
     bool AccountBoundEnabled = true;
     bool AccountBoundStartupBackfill = false;
-    bool AccountBoundSyncOnLogin = true;
+    bool AccountBoundSyncOnCreate = true;
     bool AccountBoundSyncOnLearn = true;
-    bool AccountBoundSyncOnlineOnReload = true;
     bool AccountBoundIncludeSecondaryProfessions = false;
     bool AccountBoundSyncSkillProgress = true;
     bool AccountBoundSyncProfessionRanks = true;
@@ -751,9 +750,9 @@ bool StoreSkillSnapshotForCharacter(CharacterDatabaseTransaction& trans, Charact
     return true;
 }
 
-void ApplyAccountSyncToPlayer(Player* player)
+void BackfillProfessionsForCharacter(Player* player)
 {
-    if (!Config.Enabled || !Config.AccountBoundEnabled || !Config.AccountBoundSyncOnLogin || !player)
+    if (!Config.Enabled || !Config.AccountBoundEnabled || !player)
         return;
 
     CharacterInfo const target{ player->GetGUID().GetCounter(), player->GetSession()->GetAccountId(), player->getRace(true), player->getClass() };
@@ -798,7 +797,7 @@ void ApplyAccountSyncToPlayer(Player* player)
     CommitIfNeeded(trans);
 
     if (storedRanks || storedSkills || storedRecipes)
-        LOG_INFO("module.accountboundprofessions", "AccountBoundProfessions: account profession sync persisted for player {} (ranks={}, skills={}, recipes={}). Relog may be required if the character was already loaded.",
+        LOG_INFO("module.accountboundprofessions", "AccountBoundProfessions: seeded character {} through SQL (ranks={}, skills={}, recipes={}).",
             target.Guid, storedRanks, storedSkills, storedRecipes);
 }
 
@@ -1033,9 +1032,8 @@ void LoadModuleConfig()
 
     Config.AccountBoundEnabled = Config.Enabled;
     Config.AccountBoundStartupBackfill = sConfigMgr->GetOption<bool>("AccountBound.Professions.StartupBackfill", true);
-    Config.AccountBoundSyncOnLogin = sConfigMgr->GetOption<bool>("AccountBound.Professions.SyncOnLogin", true);
+    Config.AccountBoundSyncOnCreate = sConfigMgr->GetOption<bool>("AccountBound.Professions.SyncOnCreate", true);
     Config.AccountBoundSyncOnLearn = sConfigMgr->GetOption<bool>("AccountBound.Professions.SyncOnLearn", true);
-    Config.AccountBoundSyncOnlineOnReload = sConfigMgr->GetOption<bool>("AccountBound.Professions.SyncOnlineOnReload", true);
     Config.AccountBoundIncludeSecondaryProfessions = sConfigMgr->GetOption<bool>("AccountBound.Professions.IncludeSecondaryProfessions", true);
     Config.AccountBoundSyncSkillProgress = sConfigMgr->GetOption<bool>("AccountBound.Professions.SyncSkillProgress", true);
     Config.AccountBoundSyncProfessionRanks = sConfigMgr->GetOption<bool>("AccountBound.Professions.SyncProfessionRanks", true);
@@ -1066,10 +1064,10 @@ public:
             {
                 EnforceAllowedProfessions(player);
                 NormalizeFreeProfessionPoints(player);
-
-                if (Config.AccountBoundSyncOnlineOnReload)
-                    ApplyAccountSyncToPlayer(player);
             });
+
+            if (Config.AccountBoundStartupBackfill)
+                BackfillAccountBoundProfessions();
         }
 
         LOG_INFO("module.accountboundprofessions",
@@ -1093,6 +1091,7 @@ class AccountBoundProfessionsPlayerScript : public PlayerScript
 public:
     AccountBoundProfessionsPlayerScript() : PlayerScript("AccountBoundProfessionsPlayerScript", {
         PLAYERHOOK_ON_LOGIN,
+        PLAYERHOOK_ON_CREATE,
         PLAYERHOOK_ON_LEARN_SPELL,
         PLAYERHOOK_ON_SET_SKILL
     }) { }
@@ -1100,8 +1099,13 @@ public:
     void OnPlayerLogin(Player* player) override
     {
         EnforceAllowedProfessions(player);
-        ApplyAccountSyncToPlayer(player);
         NormalizeFreeProfessionPoints(player);
+    }
+
+    void OnPlayerCreate(Player* player) override
+    {
+        if (Config.AccountBoundSyncOnCreate)
+            BackfillProfessionsForCharacter(player);
     }
 
     void OnPlayerLearnSpell(Player* player, uint32 spellId) override

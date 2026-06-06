@@ -19,6 +19,8 @@ category can be enabled, disabled and filtered independently.
 - Configurable primary-profession limit up to all 11 WotLK professions.
 - Account-wide friend lists and friend notes.
 - Per-category startup backfill for existing realms.
+- Silent SQL synchronization without learned-spell or collection spam.
+- Character creation seeding before the character's first login.
 - Per-category ID allow lists and block lists.
 - One master switch and one module configuration file.
 - Uses AzerothCore's existing character tables.
@@ -34,6 +36,27 @@ category can be enabled, disabled and filtered independently.
 
 The module uses hooks currently available in AzerothCore. Stock AzerothCore
 does not require a core patch.
+
+## Silent Database Synchronization
+
+AccountBound writes shared data directly to AzerothCore's existing character
+tables. It does not call `learnSpell()` or replay achievements, titles,
+reputation gains or friend notifications during login.
+
+The synchronization lifecycle is:
+
+1. `StartupBackfill` migrates characters that already exist before players can
+   log in.
+2. `SyncOnCreate` seeds a new character after its initial database save and
+   before its first login.
+3. Normal gameplay hooks persist newly earned data to the other characters on
+   the account.
+4. The target character loads the already-persisted rows during its next normal
+   login.
+
+This prevents login spam. If a requirement changes while a character is
+already online, such as gaining a higher riding rank, the newly eligible rows
+are stored immediately and become visible after one relog.
 
 ## Installation
 
@@ -152,7 +175,7 @@ Recommended defaults:
 
 ```ini
 AccountBound.Achievements.Enable = 1
-AccountBound.Achievements.SyncOnLogin = 1
+AccountBound.Achievements.SyncOnCreate = 1
 AccountBound.Achievements.SyncRealmFirst = 0
 AccountBound.Achievements.SyncHidden = 0
 AccountBound.Achievements.ConvertFactionSpecific = 1
@@ -164,14 +187,9 @@ specific character or realm race.
 Faction-specific achievements are converted with AzerothCore's faction-change
 mapping when `ConvertFactionSpecific = 1`.
 
-On stock AzerothCore, a newly imported achievement stored during character
-loading can require one additional relog before it appears in the achievement
-window. Existing characters migrated with startup backfill do not have this
-limitation.
-
-The optional patch in `patches/achievement-live-sync.patch` removes that extra
-relog and restores title rewards without resending achievement mail, items or
-realm announcements.
+Achievements are inserted into `character_achievement`. They are never replayed
+through the live achievement reward path, so the module does not resend
+announcements, mail, items or title notifications.
 
 ## Mounts
 
@@ -179,7 +197,7 @@ Recommended defaults:
 
 ```ini
 AccountBound.Mounts.Enable = 1
-AccountBound.Mounts.SyncOnLogin = 1
+AccountBound.Mounts.SyncOnCreate = 1
 AccountBound.Mounts.RespectFactionRestrictions = 1
 AccountBound.Mounts.ConvertFactionSpecific = 1
 AccountBound.Mounts.RequireRiding = 1
@@ -206,6 +224,7 @@ AccountBound.Mounts.CleanupInvalid = 1
 The pets category shares vanity companions only:
 
 ```ini
+AccountBound.Pets.SyncOnCreate = 1
 AccountBound.Pets.IncludeCompanionSkillLine = 1
 AccountBound.Pets.IncludeMinipetSummons = 1
 ```
@@ -221,7 +240,7 @@ Recommended defaults:
 
 ```ini
 AccountBound.Titles.Enable = 1
-AccountBound.Titles.SyncOnLogin = 1
+AccountBound.Titles.SyncOnCreate = 1
 AccountBound.Titles.SyncOnSave = 1
 AccountBound.Titles.SyncRealmFirst = 0
 AccountBound.Titles.ConvertFactionSpecific = 1
@@ -236,7 +255,7 @@ Recommended public-realm defaults:
 
 ```ini
 AccountBound.Reputations.Enable = 1
-AccountBound.Reputations.SyncOnLogin = 1
+AccountBound.Reputations.SyncOnCreate = 1
 AccountBound.Reputations.SyncOnChange = 1
 AccountBound.Reputations.SameFactionOnly = 1
 AccountBound.Reputations.ConvertFactionSpecific = 1
@@ -296,6 +315,7 @@ Warning: enabling it can remove blocked professions from existing characters.
 Account-wide profession settings:
 
 ```ini
+AccountBound.Professions.SyncOnCreate = 1
 AccountBound.Professions.SyncSkillProgress = 1
 AccountBound.Professions.SyncProfessionRanks = 1
 AccountBound.Professions.SyncRecipes = 1
@@ -317,7 +337,7 @@ The friends category mirrors the normal character friend list across every
 character on an account:
 
 ```ini
-AccountBound.Friends.SyncOnLogin = 1
+AccountBound.Friends.SyncOnCreate = 1
 AccountBound.Friends.SyncOnlineChanges = 1
 AccountBound.Friends.SyncIntervalSeconds = 3
 ```
@@ -344,6 +364,7 @@ AccountBound.Pets.StartupBackfill = 1
 AccountBound.Titles.StartupBackfill = 1
 AccountBound.Reputations.StartupBackfill = 1
 AccountBound.Professions.StartupBackfill = 1
+AccountBound.Friends.StartupBackfill = 1
 ```
 
 For an existing realm:
@@ -360,11 +381,8 @@ For an existing realm:
 Backfill uses idempotent inserts or monotonic updates, but it can touch many
 rows on a large realm.
 
-Friend-list startup backfill is disabled independently:
-
-```ini
-AccountBound.Friends.StartupBackfill = 0
-```
+Version 1.1 replaces the old `SyncOnLogin` options with `SyncOnCreate`.
+Existing custom configuration files should be updated to use the new keys.
 
 ## Safe Public-Realm Defaults
 
@@ -386,7 +404,7 @@ AccountBound.Reputations.SyncUnpairedCrossFaction = 0
 AccountBound.Professions.Primary.EnforceAllowedList = 0
 AccountBound.Professions.RequireRecipeSkill = 1
 
-AccountBound.Friends.StartupBackfill = 0
+AccountBound.Friends.StartupBackfill = 1
 ```
 
 After the initial migration, keep every broad `StartupBackfill` option disabled.
@@ -405,21 +423,6 @@ character_social
 ```
 
 No custom tables or SQL installation files are required.
-
-## Optional Instant Achievement Patch
-
-The module works without a core patch.
-
-To make newly imported achievements visible during the same login, apply:
-
-```bash
-git apply modules/AccountBound/patches/achievement-live-sync.patch
-```
-
-Then rebuild `worldserver`.
-
-The module detects the extra core method automatically. Without the patch, the
-database sync remains functional and the achievement appears on the next login.
 
 ## Troubleshooting
 
@@ -444,9 +447,9 @@ If a profession recipe is not shared:
 - Confirm the target has sufficient skill when `RequireRecipeSkill = 1`.
 - Add custom recipes to `SpellAllowList`.
 
-If achievements are stored but not immediately visible:
+If data was inserted while the target character was already online:
 
-- Relog once, or apply the optional instant achievement patch.
+- Relog once so AzerothCore reloads the updated character tables.
 
 If startup takes longer than normal:
 
@@ -458,8 +461,6 @@ If startup takes longer than normal:
 AccountBound/
   conf/
     AccountBound.conf.dist
-  patches/
-    achievement-live-sync.patch
   src/
     AccountBound.h
     Achievements.cpp

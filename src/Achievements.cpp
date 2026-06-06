@@ -2,7 +2,6 @@
  * Account-bound achievements for AzerothCore.
  */
 
-#include "AchievementMgr.h"
 #include "AccountBound.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
@@ -28,7 +27,7 @@ struct ModuleConfig
     bool Enabled = true;
     bool StartupBackfill = true;
     bool SameFactionOnly = false;
-    bool SyncOnLogin = true;
+    bool SyncOnCreate = true;
     bool SyncRealmFirst = false;
     bool SyncHidden = false;
     bool ConvertFactionSpecific = true;
@@ -44,16 +43,6 @@ struct CharacterInfo
 };
 
 ModuleConfig Config;
-
-template <typename AchievementManager>
-bool AttachImportedAchievement(AchievementManager* manager, AchievementEntry const* achievement, time_t date)
-{
-    if constexpr (requires { manager->AddAccountBoundAchievement(achievement, date); })
-        return manager->AddAccountBoundAchievement(achievement, date);
-
-    // Stock AzerothCore will load the database row on the next login.
-    return false;
-}
 
 bool CanShareBetweenRaces(uint8 sourceRace, uint8 targetRace)
 {
@@ -253,69 +242,6 @@ void BackfillAchievementsForCharacter(Player* player)
             inserted, targetGuid);
 }
 
-void LoadAccountAchievementsForPlayer(Player* player)
-{
-    if (!Config.Enabled || !Config.SyncOnLogin || !player)
-        return;
-
-    uint32 const accountId = player->GetSession()->GetAccountId();
-    uint32 const targetGuid = player->GetGUID().GetCounter();
-    uint8 const targetRace = player->getRace(true);
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT ca.achievement, MIN(ca.date), c.race "
-        "FROM character_achievement ca "
-        "INNER JOIN characters c ON c.guid = ca.guid "
-        "WHERE c.account = {} AND c.guid <> {} "
-        "GROUP BY ca.achievement, c.race "
-        "ORDER BY MIN(ca.date)",
-        accountId, targetGuid);
-
-    if (!result)
-        return;
-
-    std::unordered_map<uint32, uint32> earliestDates;
-
-    do
-    {
-        Field* fields = result->Fetch();
-        uint32 const achievementId = fields[0].Get<uint32>();
-        uint32 const date = fields[1].Get<uint32>();
-        uint8 const sourceRace = fields[2].Get<uint8>();
-
-        if (!CanShareBetweenRaces(sourceRace, targetRace))
-            continue;
-
-        uint32 const targetAchievementId = GetAchievementForRace(achievementId, targetRace);
-        if (!targetAchievementId || player->HasAchieved(targetAchievementId))
-            continue;
-
-        auto [itr, inserted] = earliestDates.try_emplace(targetAchievementId, date);
-        if (!inserted)
-            itr->second = std::min(itr->second, date);
-    } while (result->NextRow());
-
-    if (earliestDates.empty())
-        return;
-
-    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-    for (auto const& [achievementId, date] : earliestDates)
-        InsertAchievementForCharacter(trans, targetGuid, achievementId, date);
-    CommitIfNeeded(trans);
-
-    uint32 loaded = 0;
-    for (auto const& [achievementId, date] : earliestDates)
-    {
-        AchievementEntry const* achievement = sAchievementStore.LookupEntry(achievementId);
-        if (AttachImportedAchievement(player->GetAchievementMgr(), achievement, time_t(date)))
-            ++loaded;
-    }
-
-    if (loaded)
-        LOG_INFO("module.accountboundachievements",
-            "AccountBoundAchievements: loaded {} account achievement(s) for character {}.",
-            loaded, targetGuid);
-}
-
 void BackfillAllAchievements()
 {
     if (!Config.Enabled || !Config.StartupBackfill)
@@ -389,7 +315,7 @@ void LoadModuleConfig()
     Config.Enabled = AccountBound::IsCategoryEnabled("Achievements");
     Config.StartupBackfill = sConfigMgr->GetOption<bool>("AccountBound.Achievements.StartupBackfill", true);
     Config.SameFactionOnly = sConfigMgr->GetOption<bool>("AccountBound.Achievements.SameFactionOnly", false);
-    Config.SyncOnLogin = sConfigMgr->GetOption<bool>("AccountBound.Achievements.SyncOnLogin", true);
+    Config.SyncOnCreate = sConfigMgr->GetOption<bool>("AccountBound.Achievements.SyncOnCreate", true);
     Config.SyncRealmFirst = sConfigMgr->GetOption<bool>("AccountBound.Achievements.SyncRealmFirst", false);
     Config.SyncHidden = sConfigMgr->GetOption<bool>("AccountBound.Achievements.SyncHidden", false);
     Config.ConvertFactionSpecific = sConfigMgr->GetOption<bool>("AccountBound.Achievements.ConvertFactionSpecific", true);
@@ -410,9 +336,9 @@ public:
     {
         LoadModuleConfig();
         LOG_INFO("module.accountboundachievements",
-            "AccountBoundAchievements: {}. LoginSync={}, StartupBackfill={}, SameFactionOnly={}, RealmFirst={}.",
+            "AccountBoundAchievements: {}. CreateSync={}, StartupBackfill={}, SameFactionOnly={}, RealmFirst={}.",
             Config.Enabled ? (reload ? "configuration reloaded" : "configuration loaded") : "disabled",
-            Config.Enabled && Config.SyncOnLogin ? "on" : "off",
+            Config.Enabled && Config.SyncOnCreate ? "on" : "off",
             Config.Enabled && Config.StartupBackfill ? "on" : "off",
             Config.Enabled && Config.SameFactionOnly ? "on" : "off",
             Config.Enabled && Config.SyncRealmFirst ? "on" : "off");
@@ -428,19 +354,14 @@ class AccountBoundAchievementsPlayerScript : public PlayerScript
 {
 public:
     AccountBoundAchievementsPlayerScript() : PlayerScript("AccountBoundAchievementsPlayerScript", {
-        PLAYERHOOK_ON_LOAD_FROM_DB,
         PLAYERHOOK_ON_CREATE,
         PLAYERHOOK_ON_ACHI_COMPLETE
     }) { }
 
-    void OnPlayerLoadFromDB(Player* player) override
-    {
-        LoadAccountAchievementsForPlayer(player);
-    }
-
     void OnPlayerCreate(Player* player) override
     {
-        BackfillAchievementsForCharacter(player);
+        if (Config.SyncOnCreate)
+            BackfillAchievementsForCharacter(player);
     }
 
     void OnPlayerAchievementComplete(Player* player, AchievementEntry const* achievement) override

@@ -2,6 +2,15 @@
 
 All notable changes to AccountBound are documented in this file.
 
+## 1.1.0 - 2026-06-06
+
+- Changed account sharing to silent database-only synchronization.
+- Removed live `learnSpell()` calls for mounts and companion pets.
+- Removed live replay of achievements, titles, reputations and friend lists.
+- Added `SyncOnCreate` support to every shared category.
+- Enabled startup friend backfill by default.
+- Removed the optional achievement live-sync core patch.
+
 ## 1.0.0 - 2026-06-06
 
 - Initial public release.

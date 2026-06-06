@@ -12,7 +12,7 @@ AccountBound.Enable = 1
 AccountBound.Achievements.Enable = 1
 AccountBound.Achievements.StartupBackfill = 1
 AccountBound.Achievements.SameFactionOnly = 0
-AccountBound.Achievements.SyncOnLogin = 1
+AccountBound.Achievements.SyncOnCreate = 1
 AccountBound.Achievements.SyncRealmFirst = 0
 AccountBound.Achievements.SyncHidden = 0
 AccountBound.Achievements.ConvertFactionSpecific = 1
@@ -25,7 +25,7 @@ AccountBound.Achievements.BlockList = ""
 #
 AccountBound.Mounts.Enable = 1
 AccountBound.Mounts.StartupBackfill = 1
-AccountBound.Mounts.SyncOnLogin = 1
+AccountBound.Mounts.SyncOnCreate = 1
 AccountBound.Mounts.RespectFactionRestrictions = 1
 AccountBound.Mounts.ConvertFactionSpecific = 1
 AccountBound.Mounts.RequireRiding = 1
@@ -43,7 +43,6 @@ AccountBound.Mounts.BlockList = ""
 #
 AccountBound.Pets.Enable = 1
 AccountBound.Pets.StartupBackfill = 1
-AccountBound.Pets.SyncOnLogin = 1
 AccountBound.Pets.SyncOnCreate = 1
 AccountBound.Pets.SameFactionOnly = 0
 AccountBound.Pets.IncludeCompanionSkillLine = 1
@@ -56,7 +55,7 @@ AccountBound.Pets.BlockList = ""
 #
 AccountBound.Titles.Enable = 1
 AccountBound.Titles.StartupBackfill = 1
-AccountBound.Titles.SyncOnLogin = 1
+AccountBound.Titles.SyncOnCreate = 1
 AccountBound.Titles.SyncOnSave = 1
 AccountBound.Titles.SyncRealmFirst = 0
 AccountBound.Titles.ConvertFactionSpecific = 1
@@ -69,7 +68,7 @@ AccountBound.Titles.BlockList = ""
 #
 AccountBound.Reputations.Enable = 1
 AccountBound.Reputations.StartupBackfill = 1
-AccountBound.Reputations.SyncOnLogin = 1
+AccountBound.Reputations.SyncOnCreate = 1
 AccountBound.Reputations.SyncOnChange = 1
 AccountBound.Reputations.SameFactionOnly = 1
 AccountBound.Reputations.ConvertFactionSpecific = 1
@@ -89,9 +88,8 @@ AccountBound.Professions.Primary.CountOnlyAllowed = 1
 AccountBound.Professions.Primary.EnforceAllowedList = 0
 AccountBound.Professions.MaxSkillValue = 450
 AccountBound.Professions.StartupBackfill = 1
-AccountBound.Professions.SyncOnLogin = 1
+AccountBound.Professions.SyncOnCreate = 1
 AccountBound.Professions.SyncOnLearn = 1
-AccountBound.Professions.SyncOnlineOnReload = 1
 AccountBound.Professions.IncludeSecondaryProfessions = 1
 AccountBound.Professions.SyncSkillProgress = 1
 AccountBound.Professions.SyncProfessionRanks = 1
@@ -106,11 +104,11 @@ AccountBound.Professions.SpellBlockList = ""
 # Mirrors the normal friend list and notes across characters on the account.
 #
 AccountBound.Friends.Enable = 1
-AccountBound.Friends.SyncOnLogin = 1
+AccountBound.Friends.SyncOnCreate = 1
 AccountBound.Friends.SyncOnlineChanges = 1
 AccountBound.Friends.SameFactionOnly = 0
 AccountBound.Friends.SyncIntervalSeconds = 3
-AccountBound.Friends.StartupBackfill = 0
+AccountBound.Friends.StartupBackfill = 1
 
 #
 # Deliberately character-specific and therefore not shared:

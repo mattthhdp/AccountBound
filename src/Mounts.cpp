@@ -29,7 +29,7 @@ struct ModuleConfig
 {
     bool Enabled = true;
     bool StartupBackfill = true;
-    bool SyncOnLogin = false;
+    bool SyncOnCreate = true;
     bool ConvertFactionSpecific = false;
     bool RespectFactionRestrictions = true;
     bool RequireRiding = true;
@@ -489,46 +489,6 @@ void BackfillMountsForCharacter(Player* player)
             inserted, targetGuid);
 }
 
-void LearnMissingAccountMounts(Player* player, bool force = false)
-{
-    if (!Config.Enabled || !player || (!Config.SyncOnLogin && !force))
-        return;
-
-    uint8 const targetRace = player->getRace(true);
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT DISTINCT cs.spell, c.race "
-        "FROM character_spell cs "
-        "INNER JOIN characters c ON c.guid = cs.guid "
-        "WHERE c.account = {}",
-        player->GetSession()->GetAccountId());
-
-    if (!result)
-        return;
-
-    uint32 learned = 0;
-    do
-    {
-        Field* fields = result->Fetch();
-        uint32 const spellId = fields[0].Get<uint32>();
-        uint8 const sourceRace = fields[1].Get<uint8>();
-
-        if (!ShouldAccountSyncMount(spellId))
-            continue;
-
-        uint32 const targetSpellId = GetMountSpellForRace(spellId, targetRace);
-        if (!targetSpellId || !CanPlayerReceiveMount(targetSpellId, player, sourceRace) || player->HasSpell(targetSpellId))
-            continue;
-
-        player->learnSpell(targetSpellId);
-        ++learned;
-    } while (result->NextRow());
-
-    if (learned)
-        LOG_INFO("module.accountboundmounts",
-            "AccountBoundMounts: learned {} missing account mount(s) for player {}.",
-            learned, player->GetGUID().GetCounter());
-}
-
 void BackfillAllMounts()
 {
     if (!Config.Enabled || !Config.StartupBackfill)
@@ -652,7 +612,7 @@ void LoadModuleConfig()
 {
     Config.Enabled = AccountBound::IsCategoryEnabled("Mounts");
     Config.StartupBackfill = sConfigMgr->GetOption<bool>("AccountBound.Mounts.StartupBackfill", true);
-    Config.SyncOnLogin = sConfigMgr->GetOption<bool>("AccountBound.Mounts.SyncOnLogin", true);
+    Config.SyncOnCreate = sConfigMgr->GetOption<bool>("AccountBound.Mounts.SyncOnCreate", true);
     Config.ConvertFactionSpecific = sConfigMgr->GetOption<bool>("AccountBound.Mounts.ConvertFactionSpecific", true);
     Config.RespectFactionRestrictions = sConfigMgr->GetOption<bool>("AccountBound.Mounts.RespectFactionRestrictions", true);
     Config.RequireRiding = sConfigMgr->GetOption<bool>("AccountBound.Mounts.RequireRiding", true);
@@ -677,9 +637,9 @@ public:
     {
         LoadModuleConfig();
         LOG_INFO("module.accountboundmounts",
-            "AccountBoundMounts: {}. LoginSync={}, StartupBackfill={}, RequireRiding={}, RequireClass={}.",
+            "AccountBoundMounts: {}. CreateSync={}, StartupBackfill={}, RequireRiding={}, RequireClass={}.",
             Config.Enabled ? (reload ? "configuration reloaded" : "configuration loaded") : "disabled",
-            Config.Enabled && Config.SyncOnLogin ? "on" : "off",
+            Config.Enabled && Config.SyncOnCreate ? "on" : "off",
             Config.Enabled && Config.StartupBackfill ? "on" : "off",
             Config.Enabled && Config.RequireRiding ? "on" : "off",
             Config.Enabled && Config.RequireClass ? "on" : "off");
@@ -700,20 +660,15 @@ class AccountBoundMountsPlayerScript : public PlayerScript
 {
 public:
     AccountBoundMountsPlayerScript() : PlayerScript("AccountBoundMountsPlayerScript", {
-        PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_CREATE,
         PLAYERHOOK_ON_LEARN_SPELL,
         PLAYERHOOK_ON_SET_SKILL
     }) { }
 
-    void OnPlayerLogin(Player* player) override
-    {
-        LearnMissingAccountMounts(player);
-    }
-
     void OnPlayerCreate(Player* player) override
     {
-        BackfillMountsForCharacter(player);
+        if (Config.SyncOnCreate)
+            BackfillMountsForCharacter(player);
     }
 
     void OnPlayerLearnSpell(Player* player, uint32 spellId) override
@@ -727,7 +682,6 @@ public:
             return;
 
         BackfillMountsForCharacter(player);
-        LearnMissingAccountMounts(player, true);
     }
 };
 

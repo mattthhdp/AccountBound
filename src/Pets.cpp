@@ -25,7 +25,6 @@ struct ModuleConfig
 {
     bool Enabled = true;
     bool StartupBackfill = true;
-    bool SyncOnLogin = true;
     bool SyncOnCreate = true;
     bool SameFactionOnly = false;
     bool IncludeCompanionSkillLine = true;
@@ -219,46 +218,6 @@ void SeedCompanionsForCharacter(Player* player)
             inserted, targetGuid);
 }
 
-void LearnMissingAccountCompanions(Player* player)
-{
-    if (!Config.Enabled || !Config.SyncOnLogin || !player)
-        return;
-
-    uint8 const targetRace = player->getRace(true);
-    QueryResult result = CharacterDatabase.Query(
-        "SELECT DISTINCT cs.spell, c.race "
-        "FROM character_spell cs "
-        "INNER JOIN characters c ON c.guid = cs.guid "
-        "WHERE c.account = {}",
-        player->GetSession()->GetAccountId());
-
-    if (!result)
-        return;
-
-    std::unordered_set<uint32> missingSpells;
-    do
-    {
-        Field* fields = result->Fetch();
-        uint32 const spellId = fields[0].Get<uint32>();
-        uint8 const sourceRace = fields[1].Get<uint8>();
-
-        if (IsCompanionSpell(spellId) &&
-            CanShareBetweenRaces(sourceRace, targetRace) &&
-            !player->HasSpell(spellId))
-        {
-            missingSpells.insert(spellId);
-        }
-    } while (result->NextRow());
-
-    for (uint32 spellId : missingSpells)
-        player->learnSpell(spellId);
-
-    if (!missingSpells.empty())
-        LOG_INFO("module.accountboundpets",
-            "AccountBoundPets: learned {} missing account companion(s) for player {}.",
-            missingSpells.size(), player->GetGUID().GetCounter());
-}
-
 void BackfillAllCompanions()
 {
     if (!Config.Enabled || !Config.StartupBackfill)
@@ -325,7 +284,6 @@ void LoadModuleConfig()
 {
     Config.Enabled = AccountBound::IsCategoryEnabled("Pets");
     Config.StartupBackfill = sConfigMgr->GetOption<bool>("AccountBound.Pets.StartupBackfill", true);
-    Config.SyncOnLogin = sConfigMgr->GetOption<bool>("AccountBound.Pets.SyncOnLogin", true);
     Config.SyncOnCreate = sConfigMgr->GetOption<bool>("AccountBound.Pets.SyncOnCreate", true);
     Config.SameFactionOnly = sConfigMgr->GetOption<bool>("AccountBound.Pets.SameFactionOnly", false);
     Config.IncludeCompanionSkillLine = sConfigMgr->GetOption<bool>("AccountBound.Pets.IncludeCompanionSkillLine", true);
@@ -346,10 +304,9 @@ public:
     {
         LoadModuleConfig();
         LOG_INFO("module.accountboundpets",
-            "AccountBoundPets: {}. StartupBackfill={}, LoginSync={}, CreateSync={}, SameFactionOnly={}.",
+            "AccountBoundPets: {}. StartupBackfill={}, CreateSync={}, SameFactionOnly={}.",
             Config.Enabled ? (reload ? "configuration reloaded" : "configuration loaded") : "disabled",
             Config.Enabled && Config.StartupBackfill ? "on" : "off",
-            Config.Enabled && Config.SyncOnLogin ? "on" : "off",
             Config.Enabled && Config.SyncOnCreate ? "on" : "off",
             Config.Enabled && Config.SameFactionOnly ? "on" : "off");
     }
@@ -368,15 +325,9 @@ class AccountBoundPetsPlayerScript : public PlayerScript
 {
 public:
     AccountBoundPetsPlayerScript() : PlayerScript("AccountBoundPetsPlayerScript", {
-        PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_CREATE,
         PLAYERHOOK_ON_LEARN_SPELL
     }) { }
-
-    void OnPlayerLogin(Player* player) override
-    {
-        LearnMissingAccountCompanions(player);
-    }
 
     void OnPlayerCreate(Player* player) override
     {

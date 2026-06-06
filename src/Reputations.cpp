@@ -7,7 +7,6 @@
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
 #include "Log.h"
-#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "PlayerScript.h"
@@ -26,7 +25,7 @@ struct ModuleConfig
 {
     bool Enabled = true;
     bool StartupBackfill = true;
-    bool SyncOnLogin = true;
+    bool SyncOnCreate = true;
     bool SyncOnChange = true;
     bool SameFactionOnly = true;
     bool ConvertFactionSpecific = true;
@@ -50,14 +49,6 @@ struct CharacterInfo
 };
 
 ModuleConfig Config;
-bool Synchronizing = false;
-
-class ReputationSyncGuard
-{
-public:
-    ReputationSyncGuard() { Synchronizing = true; }
-    ~ReputationSyncGuard() { Synchronizing = false; }
-};
 
 void AppendOrCommit(CharacterDatabaseTransaction& trans, std::string_view sql)
 {
@@ -232,13 +223,6 @@ bool ApplyReputation(
     PersistReputation(trans, target, factionId, absoluteStanding, mergedFlags);
     target.Reputations[factionId] = { GetStoredStanding(target, factionId, absoluteStanding), mergedFlags };
 
-    if (Player* onlineTarget = ObjectAccessor::FindPlayerByLowGUID(target.Guid))
-    {
-        ReputationSyncGuard guard;
-        onlineTarget->GetReputationMgr().SetOneFactionReputation(faction, float(absoluteStanding), false);
-        onlineTarget->GetReputationMgr().SendState(onlineTarget->GetReputationMgr().GetState(faction));
-    }
-
     return true;
 }
 
@@ -262,9 +246,9 @@ uint32 MergeReputations(CharacterInfo const& source, CharacterInfo& target, Char
     return updated;
 }
 
-void SyncPlayerFromAccount(Player* player)
+void BackfillReputationsForCharacter(Player* player)
 {
-    if (!Config.Enabled || !Config.SyncOnLogin || !player)
+    if (!Config.Enabled || !player)
         return;
 
     std::vector<CharacterInfo> characters = LoadCharacters(player->GetSession()->GetAccountId());
@@ -285,13 +269,13 @@ void SyncPlayerFromAccount(Player* player)
 
     if (updated)
         LOG_INFO("module.accountboundreputations",
-            "AccountBoundReputations: loaded {} improved reputation(s) for character {}.",
+            "AccountBoundReputations: seeded {} improved reputation(s) for character {}.",
             updated, targetItr->Guid);
 }
 
 void SyncReputationToAccount(Player* player, uint32 factionId, int32 absoluteStanding)
 {
-    if (!Config.Enabled || !Config.SyncOnChange || Synchronizing || !player)
+    if (!Config.Enabled || !Config.SyncOnChange || !player)
         return;
 
     FactionEntry const* sourceFaction = sFactionStore.LookupEntry(factionId);
@@ -372,7 +356,7 @@ void LoadModuleConfig()
 {
     Config.Enabled = AccountBound::IsCategoryEnabled("Reputations");
     Config.StartupBackfill = sConfigMgr->GetOption<bool>("AccountBound.Reputations.StartupBackfill", true);
-    Config.SyncOnLogin = sConfigMgr->GetOption<bool>("AccountBound.Reputations.SyncOnLogin", true);
+    Config.SyncOnCreate = sConfigMgr->GetOption<bool>("AccountBound.Reputations.SyncOnCreate", true);
     Config.SyncOnChange = sConfigMgr->GetOption<bool>("AccountBound.Reputations.SyncOnChange", true);
     Config.SameFactionOnly = sConfigMgr->GetOption<bool>("AccountBound.Reputations.SameFactionOnly", true);
     Config.ConvertFactionSpecific = sConfigMgr->GetOption<bool>("AccountBound.Reputations.ConvertFactionSpecific", true);
@@ -393,9 +377,9 @@ public:
     {
         LoadModuleConfig();
         LOG_INFO("module.accountboundreputations",
-            "AccountBoundReputations: {}. LoginSync={}, ChangeSync={}, StartupBackfill={}, SameFactionOnly={}.",
+            "AccountBoundReputations: {}. CreateSync={}, ChangeSync={}, StartupBackfill={}, SameFactionOnly={}.",
             Config.Enabled ? (reload ? "configuration reloaded" : "configuration loaded") : "disabled",
-            Config.Enabled && Config.SyncOnLogin ? "on" : "off",
+            Config.Enabled && Config.SyncOnCreate ? "on" : "off",
             Config.Enabled && Config.SyncOnChange ? "on" : "off",
             Config.Enabled && Config.StartupBackfill ? "on" : "off",
             Config.Enabled && Config.SameFactionOnly ? "on" : "off");
@@ -411,19 +395,14 @@ class AccountBoundReputationsPlayerScript : public PlayerScript
 {
 public:
     AccountBoundReputationsPlayerScript() : PlayerScript("AccountBoundReputationsPlayerScript", {
-        PLAYERHOOK_ON_LOAD_FROM_DB,
         PLAYERHOOK_ON_CREATE,
         PLAYERHOOK_ON_REPUTATION_CHANGE
     }) { }
 
-    void OnPlayerLoadFromDB(Player* player) override
-    {
-        SyncPlayerFromAccount(player);
-    }
-
     void OnPlayerCreate(Player* player) override
     {
-        SyncPlayerFromAccount(player);
+        if (Config.SyncOnCreate)
+            BackfillReputationsForCharacter(player);
     }
 
     bool OnPlayerReputationChange(Player* player, uint32 factionId, int32& standing, bool /*incremental*/) override
