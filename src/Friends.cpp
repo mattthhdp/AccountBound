@@ -305,6 +305,9 @@ void RemoveOwnAccountFriends(uint32 accountId)
 
 uint32 SyncAccountFriends(uint32 accountId)
 {
+    if (AccountBound::IsExcludedAccount(accountId))
+        return 0;
+
     RemoveOwnAccountFriends(accountId);
     RemoveInvalidFactionFriends(accountId);
 
@@ -349,7 +352,7 @@ void CacheCharacterFriends(uint32 characterGuid)
 
 void DetectAndSyncOnlineChanges(Player* player)
 {
-    if (!player || !player->GetSession())
+    if (!player || !player->GetSession() || AccountBound::IsExcludedAccount(player->GetSession()->GetAccountId()))
         return;
 
     uint32 const accountId = player->GetSession()->GetAccountId();

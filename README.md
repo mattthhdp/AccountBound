@@ -96,6 +96,7 @@ The master switch controls the entire module:
 
 ```ini
 AccountBound.Enable = 1
+AccountBound.ExcludedAccountNamePrefix = RND
 ```
 
 Each system has an independent switch:
@@ -388,6 +389,7 @@ Existing custom configuration files should be updated to use the new keys.
 
 ```ini
 AccountBound.Enable = 1
+AccountBound.ExcludedAccountNamePrefix = RND
 
 AccountBound.Achievements.SyncRealmFirst = 0
 AccountBound.Achievements.SyncHidden = 0
